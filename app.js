@@ -125,6 +125,11 @@ function cloudBase(){
 /* 密钥防呆检查：anon key 应为 eyJ 开头的 JWT 或 sb_publishable_ 开头 */
 function cloudKeyHint(){
   const k = String(cloudConf().key||"").trim();
+  if(cloudIsGitHub()){
+    if(!k) return "GitHub 令牌不能为空：需要一个对该仓库有 Contents 读写权限的 PAT";
+    if(!/^(github_pat_|ghp_)/.test(k)) return "GitHub 令牌格式不对：应以 github_pat_（或 ghp_）开头，请到 GitHub → Settings → Developer settings 新建";
+    return "";
+  }
   if(!k) return "API 密钥不能为空";
   if(/^(ap|us|eu)-[a-z]+-?\d*$/i.test(k)) return "你填的是「地区代号」（如 ap-southeast-1），不是密钥。请到 Supabase → Project Settings → API Keys，复制 anon/public key（eyJ 开头的一长串）";
   if(!/^eyJ/.test(k) && !/^sb_publishable_/.test(k)) return "API 密钥格式不对：应为 eyJ 开头（或 sb_publishable_ 开头）的长串。请到 Supabase → Project Settings → API Keys 复制 anon/public key";
@@ -149,7 +154,75 @@ function updateCloudChip(){
     : "未配置云端：点击填写云数据库地址与密钥，实现多设备同步";
   el.style.color = cloudState.status==="err" ? "var(--danger)" : "";
 }
+/* ---------- 免费云端：GitHub 仓库存储（地址形如 https://github.com/用户名/仓库名） ---------- */
+let ghSha = null;   // 当前文件 sha，用于更新（避免 409）
+function cloudIsGitHub(){ return /github\.com/i.test(String(cloudConf().url||"")); }
+function ghRepo(){
+  const m = String(cloudConf().url||"").trim().match(/github\.com[/:]([^/#?\s]+)\/([^/#?\s]+)/i);
+  if(!m) return null;
+  return {owner:m[1], repo:m[2].replace(/\.git$/i,"")};
+}
+function ghBranch(){ return String(cloudConf().branch||"main").trim() || "main"; }
+function ghPath(){
+  const s = cloudSpace().replace(/[^\w.\-]/g,"").slice(0,40) || "default";
+  return /\.json$/i.test(s) ? s : "twb-"+s+".json";
+}
+function ghHeaders(){
+  const h = {"Accept":"application/vnd.github+json","Content-Type":"application/json"};
+  const k = String(cloudConf().key||"").trim();
+  if(k) h.Authorization = "Bearer "+k;
+  return h;
+}
+/* UTF-8 安全的 base64 编解码（GitHub Contents API 要求） */
+function b64encText(s){
+  const bytes = new TextEncoder().encode(s);
+  let bin = ""; const CH = 0x8000;
+  for(let i=0;i<bytes.length;i+=CH) bin += String.fromCharCode.apply(null, bytes.subarray(i,i+CH));
+  return btoa(bin);
+}
+function b64decText(b64){
+  const bin = atob(String(b64||"").replace(/\s/g,""));
+  const arr = new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) arr[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(arr);
+}
+function ghApiUrl(){
+  const r = ghRepo();
+  if(!r) throw new Error("GitHub 仓库地址格式应为 https://github.com/用户名/仓库名");
+  return "https://api.github.com/repos/"+r.owner+"/"+r.repo+"/contents/"+encodeURIComponent(ghPath());
+}
+function ghErr(status, text){
+  const t = String(text||"").replace(/\s+/g," ").slice(0,140);
+  if(status===401||status===403) return "GitHub 拒绝访问（"+status+"）：密钥无效、已过期，或没有该仓库的 Contents 读写权限。";
+  if(status===404) return "找不到仓库或数据文件（404）：请检查仓库地址、分支名和密钥权限。";
+  return status+" "+t;
+}
+async function ghRead(){
+  const res = await fetch(ghApiUrl()+"?ref="+encodeURIComponent(ghBranch()), {headers:ghHeaders()});
+  if(res.status === 404) return null;
+  if(!res.ok) throw new Error(ghErr(res.status, await res.text()));
+  const j = await res.json();
+  ghSha = j.sha;
+  const data = JSON.parse(b64decText(j.content));
+  return {data, updated_at:new Date(data.__savedAt||Date.now()).toISOString(), sha:j.sha};
+}
+async function ghWrite(){
+  const base = {message:"sync "+new Date().toISOString(), content:b64encText(JSON.stringify(state)), branch:ghBranch()};
+  const put = (sha)=>fetch(ghApiUrl(), {
+    method:"PUT", headers:ghHeaders(),
+    body: JSON.stringify(sha ? Object.assign({}, base, {sha}) : base)
+  });
+  let res = await put(ghSha);
+  if(res.status===409 || res.status===422){
+    const cur = await ghRead();          // sha 过期 → 取最新后重试一次
+    ghSha = cur && cur.sha;
+    res = await put(ghSha);
+  }
+  if(!res.ok) throw new Error(ghErr(res.status, await res.text()));
+  try{ const j = await res.json(); ghSha = (j.content && j.content.sha) || ghSha; }catch(e){}
+}
 async function cloudPush(){
+  if(cloudIsGitHub()) return ghWrite();
   const res = await fetch(cloudBase()+"/rest/v1/"+CLOUD_TABLE, {
     method:"POST",
     headers: Object.assign(cloudHeaders(), {"Prefer":"resolution=merge-duplicates,return=minimal"}),
@@ -158,6 +231,7 @@ async function cloudPush(){
   if(!res.ok) throw new Error(res.status+" "+(await res.text()).slice(0,120));
 }
 async function cloudFetch(){
+  if(cloudIsGitHub()) return ghRead();
   const u = cloudBase()+"/rest/v1/"+CLOUD_TABLE+"?select=id,data,updated_at&id=eq."+encodeURIComponent(cloudRowId());
   const res = await fetch(u, {headers:cloudHeaders()});
   if(!res.ok) throw new Error(res.status+" "+(await res.text()).slice(0,120));
@@ -259,10 +333,10 @@ function cloudModal(){
     : "尚未配置：填写后即可多设备共享同一份数据";
   const m = modal("云端同步设置", `
     <div class="form-grid">
-      <label class="full">云数据库地址（Supabase Project URL）
-        <input id="cl-url" value="${esc(c.url||"")}" placeholder="https://xxxxxxxx.supabase.co（只填 Project ID 也行，会自动补全）"></label>
-      <label class="full">API 密钥（anon public key，eyJ 开头那一长串）
-        <input id="cl-key" value="${esc(c.key||"")}" placeholder="eyJhbGciOiJIUzI1NiIs..."></label>
+      <label class="full">云端地址（GitHub 仓库地址，或 Supabase Project URL）
+        <input id="cl-url" value="${esc(c.url||"")}" placeholder="https://github.com/用户名/仓库名"></label>
+      <label class="full">访问令牌（GitHub 用 github_pat_ 开头；Supabase 用 eyJ 开头的 anon key）
+        <input id="cl-key" value="${esc(c.key||"")}" placeholder="github_pat_11... 或 eyJhbGciOi..."></label>
       <label>空间标识（同一份数据填同一串）
         <input id="cl-space" value="${esc(c.space||"default")}" placeholder="如 班级随机串"></label>
       <label>自动上传
@@ -341,10 +415,10 @@ function cloudRestoreModal(){
     <div class="form-grid">
       <label class="full">同步码<span class="muted">（在原来那台电脑的「☁ 云同步」设置里点「生成同步码」复制得到）</span>
         <textarea id="cr-code" rows="3" placeholder="粘贴同步码…"></textarea></label>
-      <label class="full muted">没有同步码也可手动填写：云数据库地址（Supabase Project URL）
-        <input id="cr-url" placeholder="https://xxxxxxxx.supabase.co"></label>
-      <label class="full muted">API 密钥（anon public key，eyJ 开头）
-        <input id="cr-key" placeholder="eyJ…"></label>
+      <label class="full muted">没有同步码也可手动填写：云端地址（GitHub 仓库地址 / Supabase Project URL）
+        <input id="cr-url" placeholder="https://github.com/用户名/仓库名"></label>
+      <label class="full muted">访问令牌（GitHub 的 github_pat_… / Supabase 的 eyJ…）
+        <input id="cr-key" placeholder="github_pat_… 或 eyJ…"></label>
       <label class="full" id="cr-msg" style="color:var(--text2)"></label>
     </div>`,
     [{text:"关闭"},
