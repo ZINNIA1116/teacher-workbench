@@ -95,7 +95,8 @@ function loadState(){
   save();
 }
 function save(){
-  state.__savedAt = Date.now();
+  /* 时间戳单调不减：防止云端来自"时钟略快设备"的数据在本机反复触发 拉取→重载 循环 */
+  state.__savedAt = Math.max(Date.now(), state.__savedAt || 0);
   localStorage.setItem(LS_KEY, JSON.stringify(state));
   scheduleCloudPush();
 }
@@ -170,6 +171,9 @@ function applyRemoteState(d){
   Object.assign(state, d);
   state.settings = state.settings || {};
   if(!state.settings.cloud) state.settings.cloud = keep;
+  /* 关键：应用后本地时间戳取 max(现在, 云端时间戳)，否则设备时钟略有偏差时
+     boot 会永远认为"云端更新"而陷入 拉取→重载 死循环 */
+  state.__savedAt = Math.max(Date.now(), d.__savedAt||0);
   cloudApplying = true; save(); cloudApplying = false;
 }
 function scheduleCloudPush(){
@@ -266,10 +270,27 @@ function cloudModal(){
           <option value="1" ${c.auto!==false?"selected":""}>开启（数据改动后自动上传）</option>
           <option value="0" ${c.auto===false?"selected":""}>关闭（仅手动上传）</option>
         </select></label>
-      <label class="full muted">配置随数据一起保存。换设备时：新设备打开网址 → 点本按钮 → 填入同样的地址与密钥 → 点「从云端拉取」，全部数据即刻恢复。</label>
+      <label class="full muted">配置一次即全自动：本机数据改动后自动上传云端；打开页面自动载入云端最新数据；其他设备更新时顶栏会提示一键刷新。换设备时点「生成同步码」，在新设备登录页粘贴即可一键恢复。</label>
       <label class="full" id="cl-msg" style="color:var(--text2)">${esc(msg)}</label>
     </div>`,
     [{text:"关闭"},
+     {text:"生成同步码", fn:()=>{
+        readCloudForm();
+        if(!cloudOn()){ setCloudMsg("请先填写云数据库地址与密钥，再生成同步码"); return false; }
+        const code = makeSyncCode();
+        const sc = modal("同步码（发给同事，新设备一键恢复）", `
+          <textarea readonly rows="4" style="width:100%" id="sc-code">${esc(code)}</textarea>
+          <p class="muted" style="margin-top:8px">新设备打开网址 → 登录页点「☁ 换了设备？点这里」→ 粘贴此码 → 恢复数据。此后两台设备自动保持同步。</p>`,
+          [{text:"关闭"},
+           {text:"复制同步码", cls:"btn-primary", fn:(mm)=>{
+              const ta = mm.el.querySelector("#sc-code");
+              ta.focus(); ta.select();
+              try{ document.execCommand("copy"); toast("✅ 同步码已复制"); }
+              catch(e){ if(navigator.clipboard) navigator.clipboard.writeText(code).then(()=>toast("✅ 同步码已复制")); }
+              return false;
+           }}]);
+        return false;
+     }},
      {text:"测试连接", fn:()=>{ readCloudForm(); setCloudMsg("检测中…"); cloudManual("test").then(setCloudMsg); return false; }},
      {text:"上传本机数据", fn:()=>{
         readCloudForm();
@@ -286,8 +307,8 @@ function cloudModal(){
         return false;
       }},
      {text:"保存配置", cls:"btn-primary", fn:()=>{
-        readCloudForm(); toast(cloudOn()?"☁ 云端配置已保存，开始同步…":"已保存（尚未填写完整）");
-        cloudBoot();
+        readCloudForm(); toast(cloudOn()?"☁ 云端配置已保存，开始自动同步…":"已保存（尚未填写完整）");
+        cloudBoot(); startCloudPoll();
       }}]);
   function setCloudMsg(t){ const el = m.el.querySelector("#cl-msg"); if(el) el.textContent = "状态："+t; }
   function readCloudForm(){
@@ -301,6 +322,74 @@ function cloudModal(){
     cloudApplying = true; save(); cloudApplying = false;
     updateCloudChip();
   }
+}
+
+/* ---------- v38 同步码 / 换设备一键恢复 / 云端轮询 ---------- */
+function makeSyncCode(){
+  const c = cloudConf();
+  if(!cloudOn()) return "";
+  return btoa(unescape(encodeURIComponent(JSON.stringify({u:c.url, k:c.key, s:c.space||"default"}))));
+}
+function parseSyncCode(code){
+  const o = JSON.parse(decodeURIComponent(escape(atob(String(code||"").trim()))));
+  if(!o || !o.u || !o.k) throw new Error("同步码格式不正确");
+  return o;
+}
+/* 登录页「换了设备」入口：粘贴同步码（或手填地址密钥）→ 保存配置 → 自动拉取 */
+function cloudRestoreModal(){
+  const m = modal("☁ 换设备恢复数据", `
+    <div class="form-grid">
+      <label class="full">同步码<span class="muted">（在原来那台电脑的「☁ 云同步」设置里点「生成同步码」复制得到）</span>
+        <textarea id="cr-code" rows="3" placeholder="粘贴同步码…"></textarea></label>
+      <label class="full muted">没有同步码也可手动填写：云数据库地址（Supabase Project URL）
+        <input id="cr-url" placeholder="https://xxxxxxxx.supabase.co"></label>
+      <label class="full muted">API 密钥（anon public key，eyJ 开头）
+        <input id="cr-key" placeholder="eyJ…"></label>
+      <label class="full" id="cr-msg" style="color:var(--text2)"></label>
+    </div>`,
+    [{text:"关闭"},
+     {text:"恢复数据", cls:"btn-primary", fn:()=>{
+        const el = m.el, msg = t=>{ const n = el.querySelector("#cr-msg"); if(n) n.textContent = t; };
+        try{
+          const code = el.querySelector("#cr-code").value.trim();
+          const url = el.querySelector("#cr-url").value.trim(), key = el.querySelector("#cr-key").value.trim();
+          let conf;
+          if(code) conf = parseSyncCode(code);
+          else if(url && key) conf = {u:url, k:key, s:"default"};
+          else { msg("请先粘贴同步码，或填写地址与密钥"); return false; }
+          state.settings.cloud = {url:conf.u, key:conf.k, space:conf.s||"default", auto:true};
+          cloudApplying = true; save(); cloudApplying = false;
+          msg("配置已保存，正在从云端拉取数据…");
+          cloudManual("down").then(r=>msg(r));
+          return false;
+        }catch(e){ msg("❌ "+e.message); return false; }
+     }}]);
+}
+/* 每 45 秒检查云端是否有其他设备的更新，有则提示一键刷新（不静默覆盖，避免冲掉正在编辑的内容） */
+let cloudPollTimer = null, cloudRefreshBar = null;
+function startCloudPoll(){
+  clearInterval(cloudPollTimer);
+  if(!cloudOn()) return;
+  cloudPollTimer = setInterval(cloudPollOnce, 45000);
+}
+async function cloudPollOnce(){
+  if(!bootDone || cloudBusy || cloudApplying || !cloudOn() || document.hidden) return;
+  try{
+    const row = await cloudFetch();
+    if(!row || !row.data) return;
+    const remoteTs = (row.data.__savedAt)||0;
+    if(remoteTs > (state.__savedAt||0) + 1500) showCloudRefresh();
+  }catch(e){}
+}
+function showCloudRefresh(){
+  if(cloudRefreshBar && document.body.contains(cloudRefreshBar)) return;
+  const b = document.createElement("div");
+  b.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#7B74D8;color:#fff;padding:8px 14px;font-size:13px;display:flex;gap:12px;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,.15)";
+  b.innerHTML = `<span>☁ 其他设备更新了数据，本机不是最新</span><button style="background:#fff;color:#7B74D8;border:0;border-radius:6px;padding:4px 12px;cursor:pointer;font-weight:600">立即刷新</button>`;
+  b.querySelector("button").onclick = ()=>location.reload();
+  document.body.appendChild(b);
+  cloudRefreshBar = b;
+  setTimeout(()=>{ if(b.parentNode) b.remove(); if(cloudRefreshBar===b) cloudRefreshBar = null; }, 120000);
 }
 
 /* ---------- 班级体系 ---------- */
@@ -415,7 +504,7 @@ function initLogin(){
   renderDemoChips();
   $("#login-tip").innerHTML = `教师/学生初始密码为 123456 · 超级管理员每次登录均需输入账号密码<br><span class="link" id="login-cloud">☁ 换了设备？点这里用云端数据恢复</span>`;
   const lc = $("#login-cloud");
-  if(lc) lc.onclick = cloudModal;
+  if(lc) lc.onclick = cloudRestoreModal;
   $("#login-form").onsubmit = e=>{
     e.preventDefault();
     const u = $("#login-user").value.trim(), p = $("#login-pass").value;
@@ -3863,5 +3952,5 @@ if(session){
     : !!state.users.find(u=>u.account===session.account);
   if(valid) enterApp(); else { session=null; localStorage.removeItem("twb_session"); }
 }
-// 启动云端同步（已配置时）：拉取/上传最新数据
-cloudBoot();
+// 启动云端同步（已配置时）：拉取/上传最新数据 + 定时轮询云端更新
+cloudBoot(); startCloudPoll();
